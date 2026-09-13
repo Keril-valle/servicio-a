@@ -5,5 +5,6 @@ import { SuscripcionesController } from './suscripciones.controller';
 @Module({
   controllers: [SuscripcionesController],
   providers: [SuscripcionesService],
+  exports: [SuscripcionesService],
 })
 export class SuscripcionesModule {}
