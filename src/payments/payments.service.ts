@@ -48,6 +48,9 @@ export type CreatedPayment = Payment & { onvo?: OnvoCheckout };
 
 const DEFAULT_PRODUCT = 'Producto A';
 
+const UUID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 const PAYMENT_COLUMNS = `id, order_id AS "orderId", amount::float8 AS amount,
   status, provider, external_payment_id AS "externalPaymentId",
   created_at AS "createdAt", updated_at AS "updatedAt"`;
@@ -121,6 +124,35 @@ export class PaymentsService {
       throw new NotFoundException('Pago no encontrado');
     }
     return this.toPayment(rows[0]);
+  }
+
+  // Encuentra el pago de un webhook de ONVO. Primero por el id del Payment Intent
+  // (external_payment_id); si todavía no se había guardado, por el id que mandamos en
+  // metadata.paymentId, y en ese caso se completa el external_payment_id en el mismo UPDATE.
+  // Solo busca pagos ONVO, así que un webhook de ONVO nunca toca un pago del proveedor falso.
+  async findOnvoPayment(
+    intentId: string,
+    metadataPaymentId?: string,
+  ): Promise<Payment | undefined> {
+    const byIntent = await this.database.query<PaymentRow>(
+      `SELECT ${PAYMENT_COLUMNS} FROM payments
+       WHERE provider = $2 AND external_payment_id = $1`,
+      [intentId, PaymentProvider.ONVO],
+    );
+    if (byIntent.rows[0]) {
+      return this.toPayment(byIntent.rows[0]);
+    }
+    if (!metadataPaymentId || !UUID_PATTERN.test(metadataPaymentId)) {
+      return undefined;
+    }
+    // Solo si aún no tiene id externo: no se pisa el de un Payment Intent distinto.
+    const byMetadata = await this.database.query<PaymentRow>(
+      `UPDATE payments SET external_payment_id = $2, updated_at = NOW()
+       WHERE id = $1 AND provider = $3 AND external_payment_id IS NULL
+       RETURNING ${PAYMENT_COLUMNS}`,
+      [metadataPaymentId, intentId, PaymentProvider.ONVO],
+    );
+    return byMetadata.rows[0] ? this.toPayment(byMetadata.rows[0]) : undefined;
   }
 
   async update(

@@ -14,6 +14,7 @@ import {
   PaymentStatus,
 } from '../payments/entities/payment.entity';
 import { PaymentsService } from '../payments/payments.service';
+import { OnvoClient } from '../providers/onvo/onvo.client';
 import { ReceivedWebhook, WebhookLogService } from './webhook-log.service';
 import { WebhooksController } from './webhooks.controller';
 import { WebhooksService } from './webhooks.service';
@@ -59,6 +60,7 @@ describe('Webhook de pagos y consultas de pagos (HTTP)', () => {
         WebhookLogService,
         { provide: ConfigService, useValue: { get: () => secret } },
         { provide: PaymentsService, useValue: paymentsService },
+        { provide: OnvoClient, useValue: {} },
       ],
     }).compile();
     app = module.createNestApplication({ rawBody: true });
