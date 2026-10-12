@@ -63,17 +63,36 @@ export class OnvoClient {
     return this.parseIntent(data);
   }
 
+  // Para fallar ANTES de crear registros si falta configuración, en vez de dejar un pago a medias.
+  assertConfigured(): void {
+    this.getSecretKey();
+    this.getPublishableKey();
+  }
+
+  // La clave publicable está pensada para el navegador (el SDK de ONVO la necesita);
+  // la secreta nunca sale de Service A.
+  getPublishableKey(): string {
+    return this.requireConfig('ONVO_PUBLISHABLE_KEY');
+  }
+
+  private getSecretKey(): string {
+    return this.requireConfig('ONVO_SECRET_KEY');
+  }
+
+  private requireConfig(name: string): string {
+    const value = this.configService.get<string>(name);
+    if (!value) {
+      throw new InternalServerErrorException(`Falta configurar ${name}`);
+    }
+    return value;
+  }
+
   private async request<T>(
     method: 'get' | 'post',
     path: string,
     body?: unknown,
   ): Promise<T> {
-    const secretKey = this.configService.get<string>('ONVO_SECRET_KEY');
-    if (!secretKey) {
-      throw new InternalServerErrorException(
-        'Falta configurar ONVO_SECRET_KEY',
-      );
-    }
+    const secretKey = this.getSecretKey();
 
     const url = `${ONVO_API_URL}${path}`;
     const config = {
