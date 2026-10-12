@@ -25,9 +25,31 @@ export class WebhooksController {
 
   @Post('payments')
   @HttpCode(200)
-  async receivePaymentWebhook(
+  receivePaymentWebhook(
     @Req() req: RawBodyRequest<Request>,
     @Headers('x-signature') signature: string | undefined,
+  ) {
+    return this.handle(req, signature, () =>
+      this.webhooksService.verifyAndProcess(req.rawBody, signature),
+    );
+  }
+
+  // Webhook de ONVO. Su secreto (X-Webhook-Secret) nunca se guarda en el registro.
+  @Post('onvo')
+  @HttpCode(200)
+  receiveOnvoWebhook(
+    @Req() req: RawBodyRequest<Request>,
+    @Headers('x-webhook-secret') secret: string | undefined,
+  ) {
+    return this.handle(req, undefined, () =>
+      this.webhooksService.processOnvo(req.rawBody, secret),
+    );
+  }
+
+  private async handle(
+    req: RawBodyRequest<Request>,
+    loggedSignature: string | undefined,
+    process: () => Promise<{ applied: boolean; message: string }>,
   ) {
     const log = (
       httpStatus: number,
@@ -37,7 +59,7 @@ export class WebhooksController {
     ) =>
       this.webhookLog.record({
         rawBody: req.rawBody,
-        signature,
+        signature: loggedSignature,
         httpStatus,
         outcome,
         signatureValid,
@@ -51,10 +73,7 @@ export class WebhooksController {
     }
 
     try {
-      const result = await this.webhooksService.verifyAndProcess(
-        req.rawBody,
-        signature,
-      );
+      const result = await process();
       log(200, result.applied ? 'APPLIED' : 'DUPLICATE', true, result.message);
       return result;
     } catch (error) {

@@ -72,17 +72,31 @@ export class WebhookLogService {
 }
 
 // Lee paymentId y status aunque el mensaje sea falso, para mostrar qué se intentó cambiar.
+// Entiende el cuerpo del Fake Provider y el de ONVO ({ type, data: { status, metadata } }).
 function peek(body: string): {
   paymentId: string | null;
   status: string | null;
 } {
   try {
     const parsed = JSON.parse(body) as Record<string, unknown>;
+    const data = asRecord(parsed.data);
+    const metadata = asRecord(data?.metadata);
     return {
-      paymentId: typeof parsed.paymentId === 'string' ? parsed.paymentId : null,
-      status: typeof parsed.status === 'string' ? parsed.status : null,
+      paymentId: firstString(parsed.paymentId, metadata?.paymentId),
+      status: firstString(parsed.status, data?.status),
     };
   } catch {
     return { paymentId: null, status: null };
   }
+}
+
+function firstString(...values: unknown[]): string | null {
+  const found = values.find((value) => typeof value === 'string');
+  return typeof found === 'string' ? found : null;
+}
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
 }

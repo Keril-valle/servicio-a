@@ -299,6 +299,71 @@ describe('PaymentsService', () => {
     },
   );
 
+  describe('findOnvoPayment', () => {
+    const intentId = 'cl4de13uc457301lor2o0q9w1';
+    const onvoRow = {
+      ...row,
+      provider: PaymentProvider.ONVO,
+      externalPaymentId: intentId,
+    };
+
+    it('encuentra el pago por el id del Payment Intent, solo entre pagos ONVO', async () => {
+      query.mockResolvedValueOnce({ rows: [onvoRow] });
+
+      const found = await service.findOnvoPayment(intentId, id);
+
+      expect(found?.id).toBe(id);
+      expect(found?.externalPaymentId).toBe(intentId);
+      expect(query).toHaveBeenCalledTimes(1);
+      const [sql, params] = query.mock.calls[0] as [string, unknown[]];
+      expect(sql).toContain('external_payment_id = $1');
+      expect(sql).toContain('provider = $2');
+      expect(params).toEqual([intentId, PaymentProvider.ONVO]);
+    });
+
+    it('si el intent aún no estaba guardado, usa metadata.paymentId y lo completa', async () => {
+      query
+        .mockResolvedValueOnce({ rows: [] })
+        .mockResolvedValueOnce({ rows: [onvoRow] });
+
+      const found = await service.findOnvoPayment(intentId, id);
+
+      expect(found?.externalPaymentId).toBe(intentId);
+      const [sql, params] = query.mock.calls[1] as [string, unknown[]];
+      expect(sql).toContain('UPDATE payments SET external_payment_id');
+      expect(sql).toContain('external_payment_id IS NULL');
+      expect(params).toEqual([id, intentId, PaymentProvider.ONVO]);
+    });
+
+    it('sin coincidencia por id y con metadata ausente, no encuentra nada', async () => {
+      query.mockResolvedValueOnce({ rows: [] });
+
+      await expect(
+        service.findOnvoPayment(intentId, undefined),
+      ).resolves.toBeUndefined();
+      expect(query).toHaveBeenCalledTimes(1);
+    });
+
+    it('ignora un metadata.paymentId que no es UUID sin tocar la base', async () => {
+      query.mockResolvedValueOnce({ rows: [] });
+
+      await expect(
+        service.findOnvoPayment(intentId, "1' OR '1'='1"),
+      ).resolves.toBeUndefined();
+      expect(query).toHaveBeenCalledTimes(1);
+    });
+
+    it('no pisa el id externo de un pago que ya tiene otro intent', async () => {
+      query
+        .mockResolvedValueOnce({ rows: [] })
+        .mockResolvedValueOnce({ rows: [] });
+
+      await expect(
+        service.findOnvoPayment(intentId, id),
+      ).resolves.toBeUndefined();
+    });
+  });
+
   it('rechaza un webhook para un pago de otro proveedor', async () => {
     clientQuery.mockResolvedValue({ rows: [] });
     query.mockResolvedValue({
