@@ -3,7 +3,6 @@ import {
   ConflictException,
   Logger,
   NotFoundException,
-  NotImplementedException,
   ServiceUnavailableException,
 } from '@nestjs/common';
 import { HttpService } from '@nestjs/axios';
@@ -13,6 +12,7 @@ import { randomUUID } from 'node:crypto';
 import { QueryResultRow } from 'pg';
 import { DatabaseService } from '../database/database.service';
 import { PedidosService } from '../pedidos/pedidos.service';
+import { OnvoClient } from '../providers/onvo/onvo.client';
 import { CreatePaymentDto } from './dto/create-payment.dto';
 import { UpdatePaymentDto } from './dto/update-payment.dto';
 import {
@@ -37,6 +37,15 @@ export interface PaymentConfirmation {
   payment: Payment;
 }
 
+// Lo que el frontend necesita para montar el SDK de ONVO y cobrar el Payment Intent.
+export interface OnvoCheckout {
+  paymentIntentId: string;
+  publishableKey: string;
+}
+
+// Igual que Payment, más el bloque `onvo` cuando el proveedor es ONVO.
+export type CreatedPayment = Payment & { onvo?: OnvoCheckout };
+
 const DEFAULT_PRODUCT = 'Producto A';
 
 const PAYMENT_COLUMNS = `id, order_id AS "orderId", amount::float8 AS amount,
@@ -59,18 +68,20 @@ export class PaymentsService {
     private readonly pedidosService: PedidosService,
     private readonly configService: ConfigService,
     private readonly httpService: HttpService,
+    private readonly onvoClient: OnvoClient,
   ) {}
 
-  async create(createPaymentDto: CreatePaymentDto): Promise<Payment> {
-    if (createPaymentDto.provider === PaymentProvider.ONVO) {
-      throw new NotImplementedException(
-        'El proveedor ONVO aún no está integrado',
-      );
+  async create(createPaymentDto: CreatePaymentDto): Promise<CreatedPayment> {
+    const isOnvo = createPaymentDto.provider === PaymentProvider.ONVO;
+    const product = createPaymentDto.product ?? DEFAULT_PRODUCT;
+    // Sin claves de ONVO se falla antes de crear el pedido y el pago, no después.
+    if (isOnvo) {
+      this.onvoClient.assertConfigured();
     }
 
     const payment = await this.database.transaction(async (client) => {
       const order = await this.pedidosService.create(client, {
-        product: createPaymentDto.product ?? DEFAULT_PRODUCT,
+        product,
         amount: createPaymentDto.amount,
       });
       const { rows } = await client.query<PaymentRow>(
@@ -89,7 +100,9 @@ export class PaymentsService {
       return this.toPayment(rows[0]);
     });
 
-    return this.processWithFakeProvider(payment);
+    return isOnvo
+      ? this.processWithOnvo(payment, product)
+      : this.processWithFakeProvider(payment);
   }
 
   async findAll(): Promise<Payment[]> {
@@ -144,6 +157,51 @@ export class PaymentsService {
       [id],
     );
     return rows[0] ? this.toPayment(rows[0]) : undefined;
+  }
+
+  // Crear el Payment Intent no cobra nada: el cobro lo hace el SDK en el navegador y
+  // el resultado llega por webhook (POST /webhooks/onvo). Aquí solo se guarda el id de
+  // ONVO y se devuelve lo necesario para que el frontend monte el SDK.
+  private async processWithOnvo(
+    payment: Payment,
+    product: string,
+  ): Promise<CreatedPayment> {
+    let paymentIntentId: string;
+    try {
+      const intent = await this.onvoClient.createPaymentIntent({
+        paymentId: payment.id,
+        amount: payment.amount,
+        description: `Pago ${product}`,
+      });
+      paymentIntentId = intent.id;
+    } catch (error) {
+      // Nada se cobró. Se rechaza el pago para que no quede en PENDING para siempre.
+      await this.confirmPayment(
+        payment.id,
+        PaymentStatus.REJECTED,
+        PaymentProvider.ONVO,
+      ).catch((rejectError: unknown) =>
+        this.logger.error(
+          `No se pudo marcar como rechazado el pago ${payment.id}: ${rejectError instanceof Error ? rejectError.message : 'error desconocido'}`,
+        ),
+      );
+      throw error;
+    }
+
+    // Se guarda antes de responder: así el webhook siempre encuentra el pago.
+    await this.database.query(
+      `UPDATE payments SET external_payment_id = $2, updated_at = NOW()
+       WHERE id = $1`,
+      [payment.id, paymentIntentId],
+    );
+    const saved = await this.findOne(payment.id);
+    return {
+      ...saved,
+      onvo: {
+        paymentIntentId,
+        publishableKey: this.onvoClient.getPublishableKey(),
+      },
+    };
   }
 
   private async processWithFakeProvider(payment: Payment): Promise<Payment> {

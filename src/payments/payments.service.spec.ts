@@ -1,8 +1,14 @@
+import {
+  BadGatewayException,
+  InternalServerErrorException,
+  ServiceUnavailableException,
+} from '@nestjs/common';
 import { HttpService } from '@nestjs/axios';
 import { ConfigService } from '@nestjs/config';
 import { of, throwError } from 'rxjs';
 import { DatabaseService } from '../database/database.service';
 import { PedidosService } from '../pedidos/pedidos.service';
+import { OnvoClient } from '../providers/onvo/onvo.client';
 import { PaymentProvider, PaymentStatus } from './entities/payment.entity';
 import { PaymentsService } from './payments.service';
 
@@ -27,6 +33,11 @@ describe('PaymentsService', () => {
   let transaction: jest.Mock;
   let post: jest.Mock;
   let pedidosService: { create: jest.Mock; applyPaymentStatus: jest.Mock };
+  let onvoClient: {
+    assertConfigured: jest.Mock;
+    getPublishableKey: jest.Mock;
+    createPaymentIntent: jest.Mock;
+  };
   let service: PaymentsService;
 
   beforeEach(() => {
@@ -40,11 +51,19 @@ describe('PaymentsService', () => {
       create: jest.fn().mockResolvedValue({ id: orderId }),
       applyPaymentStatus: jest.fn(),
     };
+    onvoClient = {
+      assertConfigured: jest.fn(),
+      getPublishableKey: jest
+        .fn()
+        .mockReturnValue('onvo_test_publishable_key_x'),
+      createPaymentIntent: jest.fn(),
+    };
     service = new PaymentsService(
       { query, transaction } as unknown as DatabaseService,
       pedidosService as unknown as PedidosService,
       { get: () => undefined } as unknown as ConfigService,
       { post } as unknown as HttpService,
+      onvoClient as unknown as OnvoClient,
     );
   });
 
@@ -104,11 +123,135 @@ describe('PaymentsService', () => {
     expect(query).not.toHaveBeenCalled();
   });
 
-  it('ONVO todavía no está integrado y no crea registros', async () => {
-    await expect(
-      service.create({ amount: 15000, provider: PaymentProvider.ONVO }),
-    ).rejects.toMatchObject({ status: 501 });
-    expect(transaction).not.toHaveBeenCalled();
+  describe('proveedor ONVO', () => {
+    const intentId = 'cl4de13uc457301lor2o0q9w1';
+    const onvoRow = { ...row, provider: PaymentProvider.ONVO };
+
+    it('crea el pago, el Payment Intent y devuelve lo que el frontend necesita para el SDK', async () => {
+      clientQuery.mockResolvedValue({ rows: [onvoRow] });
+      query
+        .mockResolvedValueOnce({ rows: [] }) // UPDATE external_payment_id
+        .mockResolvedValueOnce({
+          rows: [{ ...onvoRow, externalPaymentId: intentId }],
+        }); // findOne
+      onvoClient.createPaymentIntent.mockResolvedValue({
+        id: intentId,
+        status: 'requires_payment_method',
+      });
+
+      const payment = await service.create({
+        amount: 15000,
+        provider: PaymentProvider.ONVO,
+      });
+
+      expect(onvoClient.createPaymentIntent).toHaveBeenCalledWith({
+        paymentId: id,
+        amount: 15000,
+        description: 'Pago Producto A',
+      });
+      expect(clientQuery).toHaveBeenCalledWith(expect.any(String), [
+        expect.any(String),
+        orderId,
+        15000,
+        PaymentStatus.PENDING,
+        PaymentProvider.ONVO,
+        null,
+      ]);
+      expect(query).toHaveBeenNthCalledWith(
+        1,
+        expect.stringContaining('external_payment_id = $2'),
+        [id, intentId],
+      );
+      expect(payment).toMatchObject({
+        id,
+        status: PaymentStatus.PENDING,
+        provider: PaymentProvider.ONVO,
+        externalPaymentId: intentId,
+        onvo: {
+          paymentIntentId: intentId,
+          publishableKey: 'onvo_test_publishable_key_x',
+        },
+      });
+      expect(post).not.toHaveBeenCalled(); // no se usa el Fake Provider
+    });
+
+    it('la descripción usa el producto enviado', async () => {
+      clientQuery.mockResolvedValue({ rows: [onvoRow] });
+      query.mockResolvedValue({ rows: [onvoRow] });
+      onvoClient.createPaymentIntent.mockResolvedValue({
+        id: intentId,
+        status: 'requires_payment_method',
+      });
+
+      await service.create({
+        product: 'Camiseta',
+        amount: 15000,
+        provider: PaymentProvider.ONVO,
+      });
+
+      expect(onvoClient.createPaymentIntent).toHaveBeenCalledWith(
+        expect.objectContaining({ description: 'Pago Camiseta' }),
+      );
+    });
+
+    it('sin claves de ONVO falla antes de crear pedido o pago', async () => {
+      onvoClient.assertConfigured.mockImplementation(() => {
+        throw new InternalServerErrorException(
+          'Falta configurar ONVO_PUBLISHABLE_KEY',
+        );
+      });
+
+      await expect(
+        service.create({ amount: 15000, provider: PaymentProvider.ONVO }),
+      ).rejects.toMatchObject({ status: 500 });
+      expect(transaction).not.toHaveBeenCalled();
+      expect(onvoClient.createPaymentIntent).not.toHaveBeenCalled();
+    });
+
+    it('si ONVO falla, el pago queda REJECTED (no PENDING para siempre) y se propaga el error', async () => {
+      // 1.ª consulta: INSERT del pago. 2.ª: UPDATE a REJECTED dentro de confirmPayment.
+      clientQuery
+        .mockResolvedValueOnce({ rows: [onvoRow] })
+        .mockResolvedValueOnce({
+          rows: [{ ...onvoRow, status: PaymentStatus.REJECTED }],
+        });
+      onvoClient.createPaymentIntent.mockRejectedValue(
+        new BadGatewayException('ONVO rechazó la solicitud (HTTP 400)'),
+      );
+
+      await expect(
+        service.create({ amount: 15000, provider: PaymentProvider.ONVO }),
+      ).rejects.toMatchObject({ status: 502 });
+
+      expect(clientQuery).toHaveBeenLastCalledWith(
+        expect.stringContaining('status = ANY($4::payment_status[])'),
+        [
+          id,
+          PaymentStatus.REJECTED,
+          PaymentProvider.ONVO,
+          [PaymentStatus.PENDING, PaymentStatus.DEFERRED],
+        ],
+      );
+      expect(pedidosService.applyPaymentStatus).toHaveBeenCalledWith(
+        { query: clientQuery },
+        orderId,
+        PaymentStatus.REJECTED,
+      );
+      expect(query).not.toHaveBeenCalled(); // nunca se guardó un externalPaymentId
+    });
+
+    it('si además falla marcarlo como rechazado, igual se propaga el error original de ONVO', async () => {
+      clientQuery
+        .mockResolvedValueOnce({ rows: [onvoRow] })
+        .mockRejectedValueOnce(new Error('db caída'));
+      onvoClient.createPaymentIntent.mockRejectedValue(
+        new ServiceUnavailableException('No se pudo comunicar con ONVO'),
+      );
+
+      await expect(
+        service.create({ amount: 15000, provider: PaymentProvider.ONVO }),
+      ).rejects.toMatchObject({ status: 503 });
+    });
   });
 
   it.each([
