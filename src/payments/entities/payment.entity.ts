@@ -2,6 +2,7 @@ export enum PaymentStatus {
   PENDING = 'PENDING',
   APPROVED = 'APPROVED',
   REJECTED = 'REJECTED',
+  DEFERRED = 'DEFERRED',
 }
 
 export enum PaymentProvider {
@@ -11,6 +12,7 @@ export enum PaymentProvider {
 
 export class Payment {
   id!: string;
+  orderId!: string | null;
   amount!: number;
   status!: PaymentStatus;
   provider!: PaymentProvider;

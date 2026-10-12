@@ -1,17 +1,18 @@
 import {
   Injectable,
   ConflictException,
-  InternalServerErrorException,
+  Logger,
   NotFoundException,
   NotImplementedException,
-  OnModuleDestroy,
   ServiceUnavailableException,
 } from '@nestjs/common';
 import { HttpService } from '@nestjs/axios';
 import { ConfigService } from '@nestjs/config';
 import { firstValueFrom } from 'rxjs';
 import { randomUUID } from 'node:crypto';
-import { Pool, QueryResultRow } from 'pg';
+import { QueryResultRow } from 'pg';
+import { DatabaseService } from '../database/database.service';
+import { PedidosService } from '../pedidos/pedidos.service';
 import { CreatePaymentDto } from './dto/create-payment.dto';
 import { UpdatePaymentDto } from './dto/update-payment.dto';
 import {
@@ -22,6 +23,7 @@ import {
 
 interface PaymentRow extends QueryResultRow {
   id: string;
+  orderId: string | null;
   amount: number;
   status: PaymentStatus;
   provider: PaymentProvider;
@@ -30,57 +32,76 @@ interface PaymentRow extends QueryResultRow {
   updatedAt: Date | string;
 }
 
+export interface PaymentConfirmation {
+  applied: boolean;
+  payment: Payment;
+}
+
+const DEFAULT_PRODUCT = 'Producto A';
+
+const PAYMENT_COLUMNS = `id, order_id AS "orderId", amount::float8 AS amount,
+  status, provider, external_payment_id AS "externalPaymentId",
+  created_at AS "createdAt", updated_at AS "updatedAt"`;
+
+// Estados desde los que un webhook puede mover el pago a cada estado.
+const ALLOWED_PREVIOUS: Partial<Record<PaymentStatus, PaymentStatus[]>> = {
+  [PaymentStatus.DEFERRED]: [PaymentStatus.PENDING],
+  [PaymentStatus.APPROVED]: [PaymentStatus.PENDING, PaymentStatus.DEFERRED],
+  [PaymentStatus.REJECTED]: [PaymentStatus.PENDING, PaymentStatus.DEFERRED],
+};
+
 @Injectable()
-export class PaymentsService implements OnModuleDestroy {
-  private pool?: Pool;
+export class PaymentsService {
+  private readonly logger = new Logger(PaymentsService.name);
 
   constructor(
+    private readonly database: DatabaseService,
+    private readonly pedidosService: PedidosService,
     private readonly configService: ConfigService,
     private readonly httpService: HttpService,
   ) {}
 
   async create(createPaymentDto: CreatePaymentDto): Promise<Payment> {
-    const { rows } = await this.getPool().query<PaymentRow>(
-      `INSERT INTO payments (id, amount, status, provider, external_payment_id)
-       VALUES ($1, $2, $3, $4, $5)
-       RETURNING id, amount::float8 AS amount, status, provider,
-                 external_payment_id AS "externalPaymentId",
-                 created_at AS "createdAt", updated_at AS "updatedAt"`,
-      [
-        randomUUID(),
-        createPaymentDto.amount,
-        PaymentStatus.PENDING,
-        createPaymentDto.provider,
-        null,
-      ],
-    );
-    const payment = this.toPayment(rows[0]);
-
-    if (payment.provider === PaymentProvider.ONVO) {
+    if (createPaymentDto.provider === PaymentProvider.ONVO) {
       throw new NotImplementedException(
         'El proveedor ONVO aún no está integrado',
       );
     }
 
+    const payment = await this.database.transaction(async (client) => {
+      const order = await this.pedidosService.create(client, {
+        product: createPaymentDto.product ?? DEFAULT_PRODUCT,
+        amount: createPaymentDto.amount,
+      });
+      const { rows } = await client.query<PaymentRow>(
+        `INSERT INTO payments (id, order_id, amount, status, provider, external_payment_id)
+         VALUES ($1, $2, $3, $4, $5, $6)
+         RETURNING ${PAYMENT_COLUMNS}`,
+        [
+          randomUUID(),
+          order.id,
+          createPaymentDto.amount,
+          PaymentStatus.PENDING,
+          createPaymentDto.provider,
+          null,
+        ],
+      );
+      return this.toPayment(rows[0]);
+    });
+
     return this.processWithFakeProvider(payment);
   }
 
   async findAll(): Promise<Payment[]> {
-    const { rows } = await this.getPool().query<PaymentRow>(
-      `SELECT id, amount::float8 AS amount, status, provider,
-              external_payment_id AS "externalPaymentId",
-              created_at AS "createdAt", updated_at AS "updatedAt"
-       FROM payments ORDER BY created_at DESC`,
+    const { rows } = await this.database.query<PaymentRow>(
+      `SELECT ${PAYMENT_COLUMNS} FROM payments ORDER BY created_at DESC`,
     );
     return rows.map((row) => this.toPayment(row));
   }
 
   async findOne(id: string): Promise<Payment> {
-    const { rows } = await this.getPool().query<PaymentRow>(
-      `SELECT id, amount::float8 AS amount, status, provider,
-              external_payment_id AS "externalPaymentId",
-              created_at AS "createdAt", updated_at AS "updatedAt"
-       FROM payments WHERE id = $1`,
+    const { rows } = await this.database.query<PaymentRow>(
+      `SELECT ${PAYMENT_COLUMNS} FROM payments WHERE id = $1`,
       [id],
     );
     if (!rows[0]) {
@@ -109,46 +130,20 @@ export class PaymentsService implements OnModuleDestroy {
     });
     assignments.push('updated_at = NOW()');
 
-    const { rows } = await this.getPool().query<PaymentRow>(
+    const { rows } = await this.database.query<PaymentRow>(
       `UPDATE payments SET ${assignments.join(', ')} WHERE id = $1
-       RETURNING id, amount::float8 AS amount, status, provider,
-                 external_payment_id AS "externalPaymentId",
-                 created_at AS "createdAt", updated_at AS "updatedAt"`,
+       RETURNING ${PAYMENT_COLUMNS}`,
       values,
     );
     return rows[0] ? this.toPayment(rows[0]) : undefined;
   }
 
   async remove(id: string): Promise<Payment | undefined> {
-    const { rows } = await this.getPool().query<PaymentRow>(
-      `DELETE FROM payments WHERE id = $1
-       RETURNING id, amount::float8 AS amount, status, provider,
-                 external_payment_id AS "externalPaymentId",
-                 created_at AS "createdAt", updated_at AS "updatedAt"`,
+    const { rows } = await this.database.query<PaymentRow>(
+      `DELETE FROM payments WHERE id = $1 RETURNING ${PAYMENT_COLUMNS}`,
       [id],
     );
     return rows[0] ? this.toPayment(rows[0]) : undefined;
-  }
-
-  async onModuleDestroy() {
-    await this.pool?.end();
-  }
-
-  private getPool() {
-    if (this.pool) {
-      return this.pool;
-    }
-
-    const connectionString = this.configService.get<string>('DATABASE_URL');
-    if (!connectionString) {
-      throw new InternalServerErrorException('Falta configurar DATABASE_URL');
-    }
-
-    this.pool = new Pool({
-      connectionString,
-      ssl: { rejectUnauthorized: false },
-    });
-    return this.pool;
   }
 
   private async processWithFakeProvider(payment: Payment): Promise<Payment> {
@@ -167,7 +162,7 @@ export class PaymentsService implements OnModuleDestroy {
 
       // La respuesta HTTP solo acusa recibo; el estado cambia con el webhook firmado.
       if (typeof data?.externalPaymentId === 'string') {
-        await this.getPool().query(
+        await this.database.query(
           `UPDATE payments SET external_payment_id = $2, updated_at = NOW()
            WHERE id = $1`,
           [payment.id, data.externalPaymentId],
@@ -181,42 +176,60 @@ export class PaymentsService implements OnModuleDestroy {
     return this.findOne(payment.id);
   }
 
-  async confirmFakePayment(
+  async confirmPayment(
     id: string,
     status: PaymentStatus,
-  ): Promise<Payment> {
-    if (![PaymentStatus.APPROVED, PaymentStatus.REJECTED].includes(status)) {
-      throw new ConflictException(
-        'La confirmación debe ser APPROVED o REJECTED',
-      );
+    provider: PaymentProvider,
+  ): Promise<PaymentConfirmation> {
+    const allowedPrevious = ALLOWED_PREVIOUS[status];
+    if (!allowedPrevious) {
+      throw new ConflictException(`Estado no soportado por webhook: ${status}`);
     }
-    const { rows } = await this.getPool().query<PaymentRow>(
-      `UPDATE payments
-       SET status = $2, updated_at = NOW()
-       WHERE id = $1 AND provider = $3 AND status = $4
-       RETURNING id, amount::float8 AS amount, status, provider,
-                 external_payment_id AS "externalPaymentId",
-                 created_at AS "createdAt", updated_at AS "updatedAt"`,
-      [id, status, PaymentProvider.FAKE, PaymentStatus.PENDING],
-    );
-    if (rows[0]) {
-      return this.toPayment(rows[0]);
+
+    const updated = await this.database.transaction(async (client) => {
+      const { rows } = await client.query<PaymentRow>(
+        `UPDATE payments
+         SET status = $2, updated_at = NOW()
+         WHERE id = $1 AND provider = $3 AND status = ANY($4::payment_status[])
+         RETURNING ${PAYMENT_COLUMNS}`,
+        [id, status, provider, allowedPrevious],
+      );
+      if (!rows[0]) {
+        return undefined;
+      }
+      const payment = this.toPayment(rows[0]);
+      if (payment.orderId) {
+        await this.pedidosService.applyPaymentStatus(
+          client,
+          payment.orderId,
+          status,
+        );
+      }
+      return payment;
+    });
+    if (updated) {
+      return { applied: true, payment: updated };
     }
 
     const payment = await this.findOne(id);
-    if (payment.provider !== PaymentProvider.FAKE) {
-      throw new ConflictException('El pago no pertenece al proveedor FAKE');
+    if (payment.provider !== provider) {
+      throw new ConflictException(
+        `El pago no pertenece al proveedor ${provider}`,
+      );
     }
+    // Duplicados y eventos atrasados se aceptan sin cambios para que el proveedor no reintente.
     if (payment.status !== status) {
-      throw new ConflictException('El pago ya tiene un estado final diferente');
+      this.logger.warn(
+        `Webhook ${status} ignorado para el pago ${id}: ya está en ${payment.status}`,
+      );
     }
-    // Reenvíos del mismo webhook son idempotentes y no alteran updatedAt.
-    return payment;
+    return { applied: false, payment };
   }
 
   private toPayment(row: PaymentRow): Payment {
     return {
       id: row.id,
+      orderId: row.orderId,
       amount: Number(row.amount),
       status: row.status,
       provider: row.provider,

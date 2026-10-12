@@ -1,18 +1,20 @@
 import { HttpService } from '@nestjs/axios';
 import { ConfigService } from '@nestjs/config';
-import { Pool } from 'pg';
 import { of, throwError } from 'rxjs';
+import { DatabaseService } from '../database/database.service';
+import { PedidosService } from '../pedidos/pedidos.service';
 import { PaymentProvider, PaymentStatus } from './entities/payment.entity';
 import { PaymentsService } from './payments.service';
 
-jest.mock('pg', () => ({ Pool: jest.fn() }));
 jest.mock('@nestjs/axios', () => ({ HttpService: class HttpService {} }));
 jest.mock('@nestjs/config', () => ({ ConfigService: class ConfigService {} }));
 
 describe('PaymentsService', () => {
   const id = 'd81f874c-c790-4e4b-bf48-e0d839fa6f4a';
+  const orderId = '3f6c1a52-4b8e-4f3a-9d2e-7c1b5a9e0f44';
   const row = {
     id,
+    orderId,
     amount: 15000,
     status: PaymentStatus.PENDING,
     provider: PaymentProvider.FAKE,
@@ -21,100 +23,154 @@ describe('PaymentsService', () => {
     updatedAt: new Date('2026-10-08T00:00:00Z'),
   };
   let query: jest.Mock;
+  let clientQuery: jest.Mock;
+  let transaction: jest.Mock;
   let post: jest.Mock;
+  let pedidosService: { create: jest.Mock; applyPaymentStatus: jest.Mock };
   let service: PaymentsService;
 
   beforeEach(() => {
     query = jest.fn();
+    clientQuery = jest.fn();
+    transaction = jest.fn((work: (client: unknown) => Promise<unknown>) =>
+      work({ query: clientQuery }),
+    );
     post = jest.fn();
-    (Pool as unknown as jest.Mock).mockImplementation(() => ({
-      query,
-      end: jest.fn(),
-    }));
+    pedidosService = {
+      create: jest.fn().mockResolvedValue({ id: orderId }),
+      applyPaymentStatus: jest.fn(),
+    };
     service = new PaymentsService(
-      {
-        get: (name: string) =>
-          name === 'DATABASE_URL' ? 'postgresql://test' : undefined,
-      } as ConfigService,
+      { query, transaction } as unknown as DatabaseService,
+      pedidosService as unknown as PedidosService,
+      { get: () => undefined } as unknown as ConfigService,
       { post } as unknown as HttpService,
     );
   });
 
-  it('la respuesta HTTP del proveedor no aprueba el pago', async () => {
+  it('crea el pedido y el pago juntos; la respuesta del proveedor no aprueba el pago', async () => {
+    clientQuery.mockResolvedValue({ rows: [row] });
     query.mockResolvedValue({ rows: [row] });
     post.mockReturnValue(of({ data: { status: 'APPROVED' } }));
+
     const payment = await service.create({
       amount: 15000,
       provider: PaymentProvider.FAKE,
     });
-    expect(payment.status).toBe(PaymentStatus.PENDING);
-    expect(post).toHaveBeenCalledWith(
-      'http://service-b:3001/payments',
-      { paymentId: id, amount: 15000 },
-      { timeout: 5000 },
+
+    expect(payment).toMatchObject({ status: PaymentStatus.PENDING, orderId });
+    expect(pedidosService.create).toHaveBeenCalledWith(
+      { query: clientQuery },
+      { product: 'Producto A', amount: 15000 },
     );
-    expect(query).toHaveBeenCalledTimes(2);
-    expect(query).toHaveBeenNthCalledWith(1, expect.any(String), [
+    expect(clientQuery).toHaveBeenCalledWith(expect.any(String), [
       expect.any(String),
+      orderId,
       15000,
       PaymentStatus.PENDING,
       PaymentProvider.FAKE,
       null,
     ]);
+    expect(post).toHaveBeenCalledWith(
+      'http://service-b:3001/payments',
+      { paymentId: id, amount: 15000 },
+      { timeout: 5000 },
+    );
+  });
+
+  it('usa el producto enviado por el cliente', async () => {
+    clientQuery.mockResolvedValue({ rows: [row] });
+    query.mockResolvedValue({ rows: [row] });
+    post.mockReturnValue(of({ data: {} }));
+
+    await service.create({
+      product: 'Camiseta',
+      amount: 15000,
+      provider: PaymentProvider.FAKE,
+    });
+
+    expect(pedidosService.create).toHaveBeenCalledWith(expect.anything(), {
+      product: 'Camiseta',
+      amount: 15000,
+    });
   });
 
   it('una falla del proveedor no cambia el estado persistido', async () => {
-    query.mockResolvedValue({ rows: [row] });
+    clientQuery.mockResolvedValue({ rows: [row] });
     post.mockReturnValue(throwError(() => new Error('offline')));
     await expect(
       service.create({ amount: 15000, provider: PaymentProvider.FAKE }),
     ).rejects.toMatchObject({ status: 503 });
-    expect(query).toHaveBeenCalledTimes(1);
+    expect(query).not.toHaveBeenCalled();
   });
 
-  it.each([PaymentStatus.APPROVED, PaymentStatus.REJECTED])(
-    'confirma PENDING → %s con condición atómica',
-    async (status) => {
-      query.mockResolvedValue({ rows: [{ ...row, status }] });
+  it('ONVO todavía no está integrado y no crea registros', async () => {
+    await expect(
+      service.create({ amount: 15000, provider: PaymentProvider.ONVO }),
+    ).rejects.toMatchObject({ status: 501 });
+    expect(transaction).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    [PaymentStatus.APPROVED, [PaymentStatus.PENDING, PaymentStatus.DEFERRED]],
+    [PaymentStatus.REJECTED, [PaymentStatus.PENDING, PaymentStatus.DEFERRED]],
+    [PaymentStatus.DEFERRED, [PaymentStatus.PENDING]],
+  ])(
+    'aplica %s con condición atómica y actualiza el pedido',
+    async (status, allowedPrevious) => {
+      clientQuery.mockResolvedValue({ rows: [{ ...row, status }] });
+
       await expect(
-        service.confirmFakePayment(id, status),
-      ).resolves.toMatchObject({ status });
-      expect(query).toHaveBeenCalledWith(
-        expect.stringContaining('AND provider = $3 AND status = $4'),
-        [id, status, PaymentProvider.FAKE, PaymentStatus.PENDING],
+        service.confirmPayment(id, status, PaymentProvider.FAKE),
+      ).resolves.toMatchObject({ applied: true, payment: { status } });
+
+      expect(clientQuery).toHaveBeenCalledWith(
+        expect.stringContaining('status = ANY($4::payment_status[])'),
+        [id, status, PaymentProvider.FAKE, allowedPrevious],
+      );
+      expect(pedidosService.applyPaymentStatus).toHaveBeenCalledWith(
+        { query: clientQuery },
+        orderId,
+        status,
       );
     },
   );
 
-  it('acepta duplicados sin volver a cambiar el pago', async () => {
-    query.mockResolvedValueOnce({ rows: [] }).mockResolvedValueOnce({
-      rows: [{ ...row, status: PaymentStatus.APPROVED }],
-    });
-    await expect(
-      service.confirmFakePayment(id, PaymentStatus.APPROVED),
-    ).resolves.toMatchObject({ status: PaymentStatus.APPROVED });
-    expect(query).toHaveBeenCalledTimes(2);
-  });
-
   it.each([
-    { ...row, status: PaymentStatus.REJECTED },
-    { ...row, provider: PaymentProvider.ONVO },
+    [PaymentStatus.APPROVED, PaymentStatus.APPROVED],
+    [PaymentStatus.DEFERRED, PaymentStatus.APPROVED],
+    [PaymentStatus.APPROVED, PaymentStatus.REJECTED],
   ])(
-    'rechaza estado final contrario o proveedor incorrecto',
-    async (payment) => {
-      query
-        .mockResolvedValueOnce({ rows: [] })
-        .mockResolvedValueOnce({ rows: [payment] });
+    'acepta %s cuando el pago ya está en %s sin volver a cambiarlo',
+    async (incoming, current) => {
+      clientQuery.mockResolvedValue({ rows: [] });
+      query.mockResolvedValue({ rows: [{ ...row, status: current }] });
+
       await expect(
-        service.confirmFakePayment(id, PaymentStatus.APPROVED),
-      ).rejects.toMatchObject({ status: 409 });
+        service.confirmPayment(id, incoming, PaymentProvider.FAKE),
+      ).resolves.toMatchObject({
+        applied: false,
+        payment: { status: current },
+      });
+      expect(pedidosService.applyPaymentStatus).not.toHaveBeenCalled();
     },
   );
 
+  it('rechaza un webhook para un pago de otro proveedor', async () => {
+    clientQuery.mockResolvedValue({ rows: [] });
+    query.mockResolvedValue({
+      rows: [{ ...row, provider: PaymentProvider.ONVO }],
+    });
+    await expect(
+      service.confirmPayment(id, PaymentStatus.APPROVED, PaymentProvider.FAKE),
+    ).rejects.toMatchObject({ status: 409 });
+  });
+
   it('devuelve 404 para una confirmación de pago inexistente', async () => {
+    clientQuery.mockResolvedValue({ rows: [] });
     query.mockResolvedValue({ rows: [] });
     await expect(
-      service.confirmFakePayment(id, PaymentStatus.APPROVED),
+      service.confirmPayment(id, PaymentStatus.APPROVED, PaymentProvider.FAKE),
     ).rejects.toMatchObject({ status: 404 });
   });
 });

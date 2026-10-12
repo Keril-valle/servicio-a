@@ -1,41 +1,40 @@
-import { of } from 'rxjs';
-import { createHmac } from 'node:crypto';
-import type { HttpService } from '@nestjs/axios';
+import { DatabaseService } from '../database/database.service';
+import { PaymentStatus } from '../payments/entities/payment.entity';
+import { OrderStatus } from './entities/pedido.entity';
 import { PedidosService } from './pedidos.service';
-import { SuscripcionesService } from '../suscripciones/suscripciones.service';
 
-jest.mock('@nestjs/axios', () => ({
-  HttpService: class HttpService {},
-}));
+jest.mock('@nestjs/config', () => ({ ConfigService: class ConfigService {} }));
 
 describe('PedidosService', () => {
-  it('dispara un webhook firmado para las suscripciones de pedido.creado', async () => {
-    const post = jest.fn().mockReturnValue(of({ status: 200 }));
-    const httpService = { post } as unknown as HttpService;
-    const suscripcionesService = new SuscripcionesService();
-    const service = new PedidosService(httpService, suscripcionesService);
+  const orderId = '3f6c1a52-4b8e-4f3a-9d2e-7c1b5a9e0f44';
+  let query: jest.Mock;
+  let service: PedidosService;
 
-    suscripcionesService.create({
-      url: 'http://service-b:3001/webhooks/pedido',
-      event: 'pedido.creado',
-    });
+  beforeEach(() => {
+    query = jest.fn().mockResolvedValue({ rows: [] });
+    service = new PedidosService({} as DatabaseService);
+  });
 
-    const pedido = service.create({ producto: 'Café', monto: 12.5 });
-    await new Promise((resolve) => setImmediate(resolve));
+  it.each([
+    [PaymentStatus.APPROVED, OrderStatus.PAID],
+    [PaymentStatus.REJECTED, OrderStatus.PAYMENT_REJECTED],
+  ])(
+    'el pago %s cierra el pedido como %s si sigue pendiente',
+    async (paymentStatus, orderStatus) => {
+      await service.applyPaymentStatus({ query }, orderId, paymentStatus);
+      expect(query).toHaveBeenCalledWith(
+        expect.stringContaining('WHERE id = $1 AND status = $3'),
+        [orderId, orderStatus, OrderStatus.PENDING_PAYMENT],
+      );
+    },
+  );
 
-    const body = JSON.stringify(pedido);
-    const expectedSignature = createHmac('sha256', 'desarrollo-secret')
-      .update(body)
-      .digest('hex');
-
-    expect(post).toHaveBeenCalledWith(
-      'http://service-b:3001/webhooks/pedido',
-      body,
-      expect.objectContaining({
-        headers: expect.objectContaining({
-          'X-Signature': expectedSignature,
-        }),
-      }),
+  it('un pago DEFERRED deja el pedido pendiente', async () => {
+    await service.applyPaymentStatus(
+      { query },
+      orderId,
+      PaymentStatus.DEFERRED,
     );
+    expect(query).not.toHaveBeenCalled();
   });
 });

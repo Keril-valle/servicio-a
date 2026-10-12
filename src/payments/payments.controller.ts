@@ -16,9 +16,7 @@ import { PaymentsService } from './payments.service';
 export class PaymentsController {
   constructor(private readonly paymentsService: PaymentsService) {}
 
-  //https://localhost:3000/payments esa es la ruta que se va a exponer para crear un pago, y el body de la peticion debe ser un objeto de tipo CreatePaymentDto
-  //y los datos que pide es { amount: number, currency: string, description: string } 
-  /* en json es: { "amount": 100, "currency": "USD", "description": "Pago por servicios" } */
+  // Crea el pedido y su pago en PENDING: { "product": "Producto A", "amount": 15000, "provider": "FAKE" }
   @Post()
   create(@Body() createPaymentDto: CreatePaymentDto) {
     return this.paymentsService.create(createPaymentDto);

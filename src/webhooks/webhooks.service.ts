@@ -8,8 +8,9 @@ import { ConfigService } from '@nestjs/config';
 import { plainToInstance } from 'class-transformer';
 import { validateSync } from 'class-validator';
 import { createHmac, timingSafeEqual } from 'node:crypto';
+import { PaymentProvider } from '../payments/entities/payment.entity';
 import { PaymentsService } from '../payments/payments.service';
-import { FakeWebhookDto } from './dto/fake-webhook.dto';
+import { PaymentWebhookDto } from './dto/payment-webhook.dto';
 
 @Injectable()
 export class WebhooksService {
@@ -50,7 +51,7 @@ export class WebhooksService {
     if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
       throw new BadRequestException('Payload inválido');
     }
-    const dto = plainToInstance(FakeWebhookDto, payload);
+    const dto = plainToInstance(PaymentWebhookDto, payload);
     const errors = validateSync(dto, {
       whitelist: true,
       forbidNonWhitelisted: true,
@@ -61,10 +62,17 @@ export class WebhooksService {
       );
     }
 
-    const payment = await this.paymentsService.confirmFakePayment(
+    const { applied, payment } = await this.paymentsService.confirmPayment(
       dto.paymentId,
       dto.status,
+      PaymentProvider.FAKE,
     );
-    return { message: 'Webhook recibido y verificado', payment };
+    return {
+      message: applied
+        ? 'Webhook recibido y verificado'
+        : 'Webhook ya procesado; no se aplicaron cambios',
+      applied,
+      payment,
+    };
   }
 }

@@ -1,90 +1,86 @@
-import { Injectable, Logger } from '@nestjs/common';
-import { HttpService } from '@nestjs/axios';
-import { firstValueFrom } from 'rxjs';
-import { createHmac, randomUUID } from 'node:crypto';
-import { CreatePedidoDto } from './dto/create-pedido.dto';
-import { UpdatePedidoDto } from './dto/update-pedido.dto';
-import { SuscripcionesService } from '../suscripciones/suscripciones.service';
+import { Injectable, NotFoundException } from '@nestjs/common';
+import { QueryResultRow } from 'pg';
+import { DatabaseService, Queryable } from '../database/database.service';
+import { PaymentStatus } from '../payments/entities/payment.entity';
+import { OrderStatus, Pedido } from './entities/pedido.entity';
 
-export interface Pedido {
+interface OrderRow extends QueryResultRow {
   id: string;
-  producto: string;
-  monto: number;
-  fecha: string;
+  product: string;
+  amount: number;
+  status: OrderStatus;
+  createdAt: Date | string;
+  updatedAt: Date | string;
 }
+
+const ORDER_COLUMNS = `id, product, amount::float8 AS amount, status,
+  created_at AS "createdAt", updated_at AS "updatedAt"`;
+
+const ORDER_STATUS_BY_PAYMENT: Partial<Record<PaymentStatus, OrderStatus>> = {
+  [PaymentStatus.APPROVED]: OrderStatus.PAID,
+  [PaymentStatus.REJECTED]: OrderStatus.PAYMENT_REJECTED,
+};
 
 @Injectable()
 export class PedidosService {
-  private readonly logger = new Logger(PedidosService.name);
-  private readonly pedidos: Pedido[] = [];
-  private readonly hmacSecret = process.env.HMAC_SECRET ?? 'desarrollo-secret';
-  private readonly maxAttempts = 3;
+  constructor(private readonly database: DatabaseService) {}
 
-  constructor(
-    private readonly httpService: HttpService,
-    private readonly suscripcionesService: SuscripcionesService,
-  ) {}
-
-  create(createPedidoDto: CreatePedidoDto) {
-    const pedido: Pedido = {
-      id: randomUUID(),
-      ...createPedidoDto,
-      fecha: new Date().toISOString(),
-    };
-
-    this.pedidos.push(pedido);
-    void this.notifySubscribers('pedido.creado', pedido);
-    return pedido;
+  async create(
+    db: Queryable,
+    order: { product: string; amount: number },
+  ): Promise<Pedido> {
+    const { rows } = await db.query<OrderRow>(
+      `INSERT INTO orders (product, amount, status)
+       VALUES ($1, $2, $3)
+       RETURNING ${ORDER_COLUMNS}`,
+      [order.product, order.amount, OrderStatus.PENDING_PAYMENT],
+    );
+    return this.toPedido(rows[0]);
   }
 
-  findAll() {
-    return this.pedidos;
+  async findAll(): Promise<Pedido[]> {
+    const { rows } = await this.database.query<OrderRow>(
+      `SELECT ${ORDER_COLUMNS} FROM orders ORDER BY created_at DESC`,
+    );
+    return rows.map((row) => this.toPedido(row));
   }
 
-  findOne(id: number) {
-    return this.pedidos[id];
+  async findOne(id: string): Promise<Pedido> {
+    const { rows } = await this.database.query<OrderRow>(
+      `SELECT ${ORDER_COLUMNS} FROM orders WHERE id = $1`,
+      [id],
+    );
+    if (!rows[0]) {
+      throw new NotFoundException('Pedido no encontrado');
+    }
+    return this.toPedido(rows[0]);
   }
 
-  update(id: number, updatePedidoDto: UpdatePedidoDto) {
-    return `This action updates a #${id} pedido`;
-  }
-
-  remove(id: number) {
-    return `This action removes a #${id} pedido`;
-  }
-
-  private async notifySubscribers(event: string, payload: Pedido) {
-    const body = JSON.stringify(payload);
-    const signature = createHmac('sha256', this.hmacSecret).update(body).digest('hex');
-    const subscriptions = this.suscripcionesService.findByEvent(event);
-
-    await Promise.all(
-      subscriptions.map((subscription) =>
-        this.sendWebhook(subscription.url, body, signature),
-      ),
+  // DEFERRED no cierra el pedido: sigue esperando el resultado final del pago.
+  async applyPaymentStatus(
+    db: Queryable,
+    orderId: string,
+    paymentStatus: PaymentStatus,
+  ): Promise<void> {
+    const status = ORDER_STATUS_BY_PAYMENT[paymentStatus];
+    if (!status) {
+      return;
+    }
+    await db.query(
+      `UPDATE orders SET status = $2
+       WHERE id = $1 AND status = $3`,
+      [orderId, status, OrderStatus.PENDING_PAYMENT],
     );
   }
 
-  private async sendWebhook(url: string, body: string, signature: string) {
-    for (let attempt = 1; attempt <= this.maxAttempts; attempt++) {
-      try {
-        await firstValueFrom(
-          this.httpService.post(url, body, {
-            headers: {
-              'Content-Type': 'application/json',
-              'X-Signature': signature,
-            },
-          }),
-        );
-        return;
-      } catch (error) {
-        if (attempt === this.maxAttempts) {
-          this.logger.error(`No se pudo entregar el webhook a ${url}`, error);
-          return;
-        }
-
-        await new Promise((resolve) => setTimeout(resolve, 250 * attempt));
-      }
-    }
+  private toPedido(row: OrderRow): Pedido {
+    return {
+      id: row.id,
+      product: row.product,
+      amount: Number(row.amount),
+      status: row.status,
+      createdAt: new Date(row.createdAt).toISOString(),
+      updatedAt: new Date(row.updatedAt).toISOString(),
+    };
   }
 }
