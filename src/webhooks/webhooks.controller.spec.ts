@@ -14,6 +14,8 @@ import {
   PaymentStatus,
 } from '../payments/entities/payment.entity';
 import { PaymentsService } from '../payments/payments.service';
+import { PaymentMetricsService } from '../observability/payment-metrics.service';
+import { createWebhookReceiptMiddleware } from '../observability/webhook-receipt.middleware';
 import { OnvoClient } from '../providers/onvo/onvo.client';
 import { ReceivedWebhook, WebhookLogService } from './webhook-log.service';
 import { WebhooksController } from './webhooks.controller';
@@ -36,9 +38,16 @@ describe('Webhook de pagos y consultas de pagos (HTTP)', () => {
     provider: PaymentProvider.FAKE,
   };
   const paymentsService = {
+    create: jest.fn(),
     confirmPayment: jest.fn(),
     findAll: jest.fn(),
     findOne: jest.fn(),
+  };
+  const metrics = {
+    webhookReceived: jest.fn(),
+    webhookInvalid: jest.fn(),
+    recordWebhookDuration: jest.fn(),
+    paymentCreated: jest.fn(),
   };
 
   function sign(body: string) {
@@ -61,9 +70,11 @@ describe('Webhook de pagos y consultas de pagos (HTTP)', () => {
         { provide: ConfigService, useValue: { get: () => secret } },
         { provide: PaymentsService, useValue: paymentsService },
         { provide: OnvoClient, useValue: {} },
+        { provide: PaymentMetricsService, useValue: metrics },
       ],
     }).compile();
     app = module.createNestApplication({ rawBody: true });
+    app.use(createWebhookReceiptMiddleware(module.get(PaymentMetricsService)));
     app.useGlobalPipes(
       new ValidationPipe({ whitelist: true, forbidNonWhitelisted: true }),
     );
@@ -86,6 +97,18 @@ describe('Webhook de pagos y consultas de pagos (HTTP)', () => {
     await app.close();
   });
 
+  afterEach(() => {
+    // Cada WebHook que entra al controlador termina en el finally, incluso con error.
+    for (const call of metrics.recordWebhookDuration.mock.calls as [
+      PaymentProvider,
+      number,
+    ][]) {
+      expect(call[0]).toBe(PaymentProvider.FAKE);
+      expect(call[1]).toBeGreaterThanOrEqual(0);
+      expect(Number.isFinite(call[1])).toBe(true);
+    }
+  });
+
   it('verifica los bytes originales con espacios y confirma el pago', async () => {
     const body = `{ "event": "payment.updated", "paymentId": "${paymentId}", "status": "APPROVED" }`;
     await request(app.getHttpServer())
@@ -104,6 +127,10 @@ describe('Webhook de pagos y consultas de pagos (HTTP)', () => {
       PaymentStatus.APPROVED,
       PaymentProvider.FAKE,
     );
+    expect(metrics.webhookReceived).toHaveBeenCalledTimes(1);
+    expect(metrics.webhookReceived).toHaveBeenCalledWith(PaymentProvider.FAKE);
+    expect(metrics.recordWebhookDuration).toHaveBeenCalledTimes(1);
+    expect(metrics.webhookInvalid).not.toHaveBeenCalled();
   });
 
   it('acepta DEFERRED y el identificador externo del proveedor', async () => {
@@ -160,6 +187,10 @@ describe('Webhook de pagos y consultas de pagos (HTTP)', () => {
         .send({ event: 'payment.updated', paymentId, status: 'APPROVED' })
         .expect(401);
       expect(paymentsService.confirmPayment).not.toHaveBeenCalled();
+      expect(metrics.webhookInvalid).toHaveBeenCalledTimes(1);
+      expect(metrics.webhookInvalid).toHaveBeenCalledWith(PaymentProvider.FAKE);
+      expect(metrics.webhookReceived).toHaveBeenCalledTimes(1);
+      expect(metrics.recordWebhookDuration).toHaveBeenCalledTimes(1);
     },
   );
 
@@ -192,6 +223,7 @@ describe('Webhook de pagos y consultas de pagos (HTTP)', () => {
       .send(body)
       .expect(400);
     expect(paymentsService.confirmPayment).not.toHaveBeenCalled();
+    expect(metrics.webhookInvalid).not.toHaveBeenCalled();
   });
 
   it('registra cada webhook recibido, también los rechazados', async () => {
@@ -253,6 +285,9 @@ describe('Webhook de pagos y consultas de pagos (HTTP)', () => {
       outcome: 'STORE_DOWN',
       signatureValid: null,
     });
+    expect(metrics.webhookReceived).toHaveBeenCalledTimes(1);
+    expect(metrics.webhookInvalid).not.toHaveBeenCalled();
+    expect(metrics.recordWebhookDuration).toHaveBeenCalledTimes(1);
   });
 
   it('valida el interruptor de la simulación', async () => {
@@ -290,5 +325,52 @@ describe('Webhook de pagos y consultas de pagos (HTTP)', () => {
   it('rechaza identificadores inválidos antes de consultar PostgreSQL', async () => {
     await request(app.getHttpServer()).get('/payments/no-es-uuid').expect(400);
     expect(paymentsService.findOne).not.toHaveBeenCalled();
+  });
+
+  it('un fallo de PostgreSQL no se registra como firma inválida', async () => {
+    paymentsService.confirmPayment.mockRejectedValue(
+      new Error('database unavailable'),
+    );
+    const body = JSON.stringify({
+      event: 'payment.updated',
+      paymentId,
+      status: 'APPROVED',
+    });
+    await request(app.getHttpServer())
+      .post('/webhooks/payments')
+      .set('Content-Type', 'application/json')
+      .set('X-Signature', sign(body))
+      .send(body)
+      .expect(500);
+    expect(metrics.webhookReceived).toHaveBeenCalledTimes(1);
+    expect(metrics.webhookInvalid).not.toHaveBeenCalled();
+    expect(metrics.recordWebhookDuration).toHaveBeenCalledTimes(1);
+  });
+
+  it('cuenta recepción aunque el parser rechace un JSON malformado', async () => {
+    await request(app.getHttpServer())
+      .post('/webhooks/payments')
+      .set('Content-Type', 'application/json')
+      .send('{malformed')
+      .expect(400);
+    expect(metrics.webhookReceived).toHaveBeenCalledWith(PaymentProvider.FAKE);
+    expect(metrics.webhookReceived).toHaveBeenCalledTimes(1);
+    expect(metrics.webhookInvalid).not.toHaveBeenCalled();
+    expect(metrics.recordWebhookDuration).not.toHaveBeenCalled();
+    expect(paymentsService.confirmPayment).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { amount: -1, provider: 'FAKE' },
+    { amount: 100, provider: 'OTHER' },
+    { provider: 'FAKE' },
+  ])('no crea ni cuenta pagos con validación inválida: %j', async (payload) => {
+    await request(app.getHttpServer())
+      .post('/payments')
+      .send(payload)
+      .expect(400);
+    expect(paymentsService.create).not.toHaveBeenCalled();
+    expect(metrics.paymentCreated).not.toHaveBeenCalled();
+    expect(metrics.webhookReceived).not.toHaveBeenCalled();
   });
 });

@@ -12,6 +12,8 @@ import {
   PaymentStatus,
 } from '../payments/entities/payment.entity';
 import { PaymentsService } from '../payments/payments.service';
+import { PaymentMetricsService } from '../observability/payment-metrics.service';
+import { createWebhookReceiptMiddleware } from '../observability/webhook-receipt.middleware';
 import { OnvoClient } from '../providers/onvo/onvo.client';
 import { ReceivedWebhook, WebhookLogService } from './webhook-log.service';
 import { WebhooksController } from './webhooks.controller';
@@ -41,6 +43,11 @@ describe('POST /webhooks/onvo (HTTP)', () => {
     confirmPayment: jest.fn(),
   };
   const onvoClient = { getPaymentIntent: jest.fn() };
+  const metrics = {
+    webhookReceived: jest.fn(),
+    webhookInvalid: jest.fn(),
+    recordWebhookDuration: jest.fn(),
+  };
 
   function event(type: string, overrides: Record<string, unknown> = {}) {
     return JSON.stringify({
@@ -84,9 +91,11 @@ describe('POST /webhooks/onvo (HTTP)', () => {
         },
         { provide: PaymentsService, useValue: paymentsService },
         { provide: OnvoClient, useValue: onvoClient },
+        { provide: PaymentMetricsService, useValue: metrics },
       ],
     }).compile();
     app = module.createNestApplication({ rawBody: true });
+    app.use(createWebhookReceiptMiddleware(module.get(PaymentMetricsService)));
     app.useGlobalPipes(
       new ValidationPipe({ whitelist: true, forbidNonWhitelisted: true }),
     );
@@ -119,6 +128,11 @@ describe('POST /webhooks/onvo (HTTP)', () => {
       await send(event('payment-intent.succeeded'), null).expect(401);
       expect(paymentsService.findOnvoPayment).not.toHaveBeenCalled();
       expect(paymentsService.confirmPayment).not.toHaveBeenCalled();
+      expect(metrics.webhookInvalid).toHaveBeenCalledWith(PaymentProvider.ONVO);
+      expect(metrics.webhookReceived).toHaveBeenCalledWith(
+        PaymentProvider.ONVO,
+      );
+      expect(metrics.recordWebhookDuration).toHaveBeenCalledTimes(1);
     });
 
     it('con un secreto distinto responde 401', async () => {
@@ -130,6 +144,7 @@ describe('POST /webhooks/onvo (HTTP)', () => {
           );
         });
       expect(paymentsService.confirmPayment).not.toHaveBeenCalled();
+      expect(metrics.webhookInvalid).toHaveBeenCalledTimes(1);
     });
 
     it('un secreto más largo que el real también se rechaza', async () => {
@@ -143,6 +158,7 @@ describe('POST /webhooks/onvo (HTTP)', () => {
       await send(event('payment-intent.succeeded'), '').expect(500);
       await send(event('payment-intent.succeeded')).expect(500);
       expect(paymentsService.confirmPayment).not.toHaveBeenCalled();
+      expect(metrics.webhookInvalid).not.toHaveBeenCalled();
     });
 
     it('el secreto recibido nunca queda en el registro de webhooks', async () => {
@@ -179,6 +195,15 @@ describe('POST /webhooks/onvo (HTTP)', () => {
         paymentId,
         PaymentStatus.APPROVED,
         PaymentProvider.ONVO,
+      );
+      expect(metrics.webhookReceived).toHaveBeenCalledTimes(1);
+      expect(metrics.webhookReceived).toHaveBeenCalledWith(
+        PaymentProvider.ONVO,
+      );
+      expect(metrics.webhookInvalid).not.toHaveBeenCalled();
+      expect(metrics.recordWebhookDuration).toHaveBeenCalledWith(
+        PaymentProvider.ONVO,
+        expect.any(Number),
       );
     });
 
@@ -280,6 +305,8 @@ describe('POST /webhooks/onvo (HTTP)', () => {
       );
       await send(event('payment-intent.succeeded')).expect(502);
       expect(paymentsService.confirmPayment).not.toHaveBeenCalled();
+      expect(metrics.webhookInvalid).not.toHaveBeenCalled();
+      expect(metrics.recordWebhookDuration).toHaveBeenCalledTimes(1);
     });
 
     it('con ONVO_VERIFY_EVENTS=false confía en el evento y no consulta a ONVO', async () => {
@@ -313,5 +340,18 @@ describe('POST /webhooks/onvo (HTTP)', () => {
     webhookLog.setStoreDown(true);
     await send(event('payment-intent.succeeded')).expect(503);
     expect(paymentsService.confirmPayment).not.toHaveBeenCalled();
+    expect(metrics.webhookReceived).toHaveBeenCalledTimes(1);
+    expect(metrics.webhookInvalid).not.toHaveBeenCalled();
+    expect(metrics.recordWebhookDuration).toHaveBeenCalledTimes(1);
+  });
+
+  it('un fallo de PostgreSQL no es un secreto de WebHook inválido', async () => {
+    paymentsService.confirmPayment.mockRejectedValue(
+      new Error('database unavailable'),
+    );
+    await send(event('payment-intent.succeeded')).expect(500);
+    expect(metrics.webhookReceived).toHaveBeenCalledWith(PaymentProvider.ONVO);
+    expect(metrics.webhookInvalid).not.toHaveBeenCalled();
+    expect(metrics.recordWebhookDuration).toHaveBeenCalledTimes(1);
   });
 });

@@ -6,11 +6,13 @@ import { PaymentsModule } from './payments/payments.module';
 import { ConfigModule } from '@nestjs/config';
 import { WebhooksModule } from './webhooks/webhooks.module';
 import { DatabaseModule } from './database/database.module';
+import { MetricsModule } from './observability/metrics.module';
 
 @Module({
   imports: [
     ConfigModule.forRoot({ isGlobal: true, envFilePath: ['../.env', '.env'] }),
     DatabaseModule,
+    MetricsModule,
     PedidosModule,
     PaymentsModule,
     WebhooksModule,

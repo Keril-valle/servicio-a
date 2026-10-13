@@ -13,6 +13,7 @@ import { QueryResultRow } from 'pg';
 import { DatabaseService } from '../database/database.service';
 import { PedidosService } from '../pedidos/pedidos.service';
 import { OnvoClient } from '../providers/onvo/onvo.client';
+import { PaymentMetricsService } from '../observability/payment-metrics.service';
 import { CreatePaymentDto } from './dto/create-payment.dto';
 import { UpdatePaymentDto } from './dto/update-payment.dto';
 import {
@@ -72,6 +73,7 @@ export class PaymentsService {
     private readonly configService: ConfigService,
     private readonly httpService: HttpService,
     private readonly onvoClient: OnvoClient,
+    private readonly metrics: PaymentMetricsService,
   ) {}
 
   async create(createPaymentDto: CreatePaymentDto): Promise<CreatedPayment> {
@@ -102,6 +104,9 @@ export class PaymentsService {
       );
       return this.toPayment(rows[0]);
     });
+
+    // transaction() solo resuelve después del COMMIT, no al terminar el INSERT.
+    this.metrics.paymentCreated(payment.provider);
 
     return isOnvo
       ? this.processWithOnvo(payment, product)
@@ -298,6 +303,7 @@ export class PaymentsService {
       return payment;
     });
     if (updated) {
+      this.metrics.paymentConfirmed(updated.provider, updated.status);
       return { applied: true, payment: updated };
     }
 

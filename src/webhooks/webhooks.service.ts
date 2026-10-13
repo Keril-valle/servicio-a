@@ -16,6 +16,7 @@ import {
 } from '../payments/entities/payment.entity';
 import { PaymentsService } from '../payments/payments.service';
 import { OnvoClient } from '../providers/onvo/onvo.client';
+import { PaymentMetricsService } from '../observability/payment-metrics.service';
 import { PaymentWebhookDto } from './dto/payment-webhook.dto';
 
 // Eventos de ONVO que nos interesan (ONVO_CONTRACT.md, sección 5). Cualquier otro se
@@ -44,6 +45,7 @@ export class WebhooksService {
     private readonly configService: ConfigService,
     private readonly paymentsService: PaymentsService,
     private readonly onvoClient: OnvoClient,
+    private readonly metrics: PaymentMetricsService,
   ) {}
 
   async verifyAndProcess(
@@ -51,9 +53,11 @@ export class WebhooksService {
     signature: string | undefined,
   ) {
     if (!rawBody?.length) {
+      this.metrics.webhookInvalid(PaymentProvider.FAKE);
       throw new UnauthorizedException('Body vacío');
     }
     if (!signature || !/^[a-f\d]{64}$/i.test(signature)) {
+      this.metrics.webhookInvalid(PaymentProvider.FAKE);
       throw new UnauthorizedException(
         'Falta X-Signature o su formato es inválido',
       );
@@ -66,6 +70,7 @@ export class WebhooksService {
     const expected = createHmac('sha256', secret).update(rawBody).digest();
     const actual = Buffer.from(signature, 'hex');
     if (!timingSafeEqual(expected, actual)) {
+      this.metrics.webhookInvalid(PaymentProvider.FAKE);
       throw new UnauthorizedException('Firma HMAC inválida');
     }
 
@@ -119,6 +124,7 @@ export class WebhooksService {
       );
     }
     if (!secretHeader || !sameSecret(secretHeader, expectedSecret)) {
+      this.metrics.webhookInvalid(PaymentProvider.ONVO);
       throw new UnauthorizedException('X-Webhook-Secret ausente o inválido');
     }
 
