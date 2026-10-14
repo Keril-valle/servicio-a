@@ -115,7 +115,9 @@ inspeccionar el payload: **no prueba HTTP/protobuf de Railway ni Grafana Cloud**
   y un histograma recibidos por HTTP/JSON local usando el preload existente.
 - `npm run test:e2e -- --runInBand`: **falló antes de ejecutar pruebas** por
   carga ESM de `@nestjs/config` en Jest. No se corrigió fuera del alcance.
-- Railway/Grafana Cloud: **no verificados**.
+- Railway: **desplegado** en `cd518647` (deployment `6577f356…`, SUCCESS, rama
+  `master`), comprobado el 2026-10-13. Grafana Cloud: ver
+  `../../../Grafana/README.md`.
 
 ## Despliegue en Railway
 
@@ -131,7 +133,7 @@ inspeccionar el payload: **no prueba HTTP/protobuf de Railway ni Grafana Cloud**
 5. Revisar logs de arranque y errores del exportador sin compartir headers,
    connection strings ni secretos. Evitar publicar logs detallados sensibles.
 
-No se ha desplegado esta implementación desde esta sesión.
+Desplegado en Railway: commit `cd518647` (deployment `6577f356…`, SUCCESS), comprobado el 2026-10-13.
 
 ## Generar eventos de demostración
 
@@ -185,107 +187,9 @@ send().catch(() => { console.error('Falló el envío de prueba'); process.exitCo
 - Un envío ONVO con `X-Webhook-Secret` deliberadamente incorrecto permite probar
   recibidos/ inválidos con `provider=ONVO`, sin confirmar el pago.
 
-## Verificación en Grafana Cloud
+## Grafana Cloud
 
-1. Esperar al menos dos ciclos de exportación y la ingestión. El SDK instalado
-   usa 60000 ms por defecto si no se define `OTEL_METRIC_EXPORT_INTERVAL`;
-   comenzar revisando después de 2–3 minutos.
-2. Abrir **Explore**, seleccionar la fuente de métricas Prometheus/Grafana Cloud
-   y un intervalo que incluya los eventos, por ejemplo los últimos 30 min.
-3. Buscar los nombres:
-
-   ```promql
-   {__name__=~"payments_.*|webhooks_.*|webhook_processing_.*"}
-   ```
-
-4. Inspeccionar nombres y etiquetas reales. Los nombres de la tabla son
-   **esperados**, no observados en Grafana desde esta sesión. La traducción puede
-   agregar `_total` y convertir `s` a `_seconds`, o preservar nombres según la
-   ingestión. No agregar `_total` al código sin comprobar lo recibido.
-5. Filtrar Service A usando etiquetas presentes. Por ejemplo, **solo si existe**,
-   `{service_name="servicio-a"}`. Algunos backends usan `job` o `target_info`;
-   no asumir que `service.name` se convierte siempre en `service_name`.
-6. Las series aparecen al registrar su primer evento: ausencia de inválidos
-   puede significar que aún no hubo rechazos. `increase()` necesita muestras y
-   puede no reflejar eventos anteriores a la primera exportación. Comprobar
-   también el valor del contador y generar más eventos tras obtener una línea base.
-7. Si no hay series, verificar exportador de métricas, endpoint/protocolo,
-   permisos de credenciales y errores OTLP, sin mostrar valores privados.
-
-El receptor local aceptando datos **no** demuestra recepción en Grafana. Falta
-observar las series después del despliegue y comprobar el transporte de producción.
-
-## Consultas PromQL
-
-Suponen los nombres Prometheus de la tabla: reemplazarlos si Explore muestra
-otros y agregar el filtro real de Service A/entorno.
-
-```promql
-sum(increase(payments_created_total[1h]))
-sum(increase(payments_approved_total[1h]))
-sum(increase(payments_rejected_total[1h]))
-sum(increase(webhooks_received_total[1h]))
-sum(increase(webhooks_invalid_total[1h]))
-```
-
-Por proveedor y tasas por segundo:
-
-```promql
-sum by (provider) (increase(webhooks_received_total[1h]))
-sum by (provider) (increase(webhooks_invalid_total[1h]))
-sum by (provider) (rate(payments_created_total[5m]))
-sum by (provider) (rate(payments_approved_total[5m]))
-sum by (provider) (rate(payments_rejected_total[5m]))
-```
-
-En paneles Stat usar `[$__range]` para el intervalo seleccionado; en gráficos
-de tasa usar `[$__rate_interval]`. `increase()` compensa reinicios observados,
-pero extrapola y puede mostrar decimales: no es un conteo contable exacto.
-
-P95 y promedio en segundos, para histograma clásico:
-
-```promql
-histogram_quantile(
-  0.95,
-  sum by (le, provider) (rate(webhook_processing_duration_seconds_bucket[5m]))
-)
-```
-
-```promql
-sum by (provider) (rate(webhook_processing_duration_seconds_sum[5m]))
-/
-sum by (provider) (rate(webhook_processing_duration_seconds_count[5m]))
-```
-
-Si llega un histograma nativo en vez de series `_bucket`, usar el nombre
-observado con esta forma:
-
-```promql
-histogram_quantile(
-  0.95,
-  sum by (provider) (rate(webhook_processing_duration_seconds[5m]))
-)
-```
-
-## Dashboard manual posterior
-
-Crear **MONITOREO DE PAGOS — SERVICE A** con filtro de servicio/entorno:
-
-| Panel                             | Tipo y consulta                                                                                  |
-| --------------------------------- | ------------------------------------------------------------------------------------------------ |
-| Pagos creados                     | Stat: `sum(increase(payments_created_total[$__range]))`                                          |
-| Pagos aprobados                   | Stat: `sum(increase(payments_approved_total[$__range]))`                                         |
-| Pagos rechazados                  | Stat: `sum(increase(payments_rejected_total[$__range]))`                                         |
-| WebHooks recibidos                | Stat: `sum(increase(webhooks_received_total[$__range]))`                                         |
-| WebHooks inválidos                | Stat: `sum(increase(webhooks_invalid_total[$__range]))`                                          |
-| Tiempo de procesamiento           | Stat: P95, unidad segundos.                                                                      |
-| Pagos creados a través del tiempo | Time series: tasa de creados por proveedor.                                                      |
-| Aprobaciones vs rechazos          | Time series: tasas de aprobados/rechazados, dos consultas y leyendas separadas.                  |
-| WebHooks recibidos por proveedor  | Time series: `sum by (provider) (rate(webhooks_received_total[$__rate_interval]))`.              |
-| Errores de WebHook                | Time series: tasa de inválidos por proveedor; son errores de autenticidad, no todos los 4xx/5xx. |
-| Latencia del procesamiento        | Time series: P95 y promedio por proveedor.                                                       |
-
-No se creó un dashboard programáticamente.
+La verificación en Grafana Cloud, las consultas PromQL y los paneles de Service A y Service B están en [`../../../Grafana/README.md`](../../../Grafana/README.md). Un receptor local que acepta datos **no** demuestra recepción en Grafana Cloud.
 
 ## Limitaciones y semántica
 
@@ -304,5 +208,5 @@ No se creó un dashboard programáticamente.
 - La suite e2e de arranque falla antes de ejecutar casos por la carga ESM de
   `@nestjs/config` en Jest en este entorno; las suites HTTP usan mocks compatibles.
   No se cambiaron dependencias ni configuración ESM para este trabajo.
-- Pendiente validar despliegue y recepción real en Grafana Cloud; no hay
-  comprobación de producción desde esta sesión.
+- La recepción en Grafana Cloud está pendiente de confirmar; ver
+  `../../../Grafana/README.md`.
